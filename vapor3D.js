@@ -128,6 +128,7 @@
   const fbos = new Map();
   const textures = new Map();
   const vbos = [];
+  const rbos = [];
 
   const vectors = new Map();
 
@@ -359,17 +360,10 @@
           {
             opcode: "tex_LoadFromCostume",
             blockType: "command",
-            text: "load texture from costume [C]",
+            text: "load costume [C] as texture [NAME]",
             arguments: {
-              C: { type: "string", menu: "costumeMenu" }
-            }
-          },
-          {
-            opcode: "tex_GetId",
-            blockType: "reporter",
-            text: "get id for texture [NAME]",
-            arguments: {
-              NAME: { type: "string", menu: "costumeMenu" }
+              C: { type: "string", menu: "costumeMenu" },
+              NAME: { type: "string", defaultValue: "tex1" }
             }
           },
           {
@@ -521,19 +515,22 @@
     }
 
     gl_ResetResources() {
-      shaders.forEach(p => gl3d.deleteProgram(p)); shaders.clear();
-      fbos.forEach(f => gl3d.deleteFramebuffer(f)); fbos.clear();
-      vaos.forEach(v => gl3d.deleteVertexArray(v.vao)); vaos.clear();
-      vbos.forEach(b => gl3d.deleteBuffer(b)); vbos.length = 0;
-      // 清理JS引用
+      shaders.forEach(p => gl3d.deleteProgram(p));
       shaders.clear();
+      fbos.forEach(f => gl3d.deleteFramebuffer(f));
       fbos.clear();
-      textures.clear();
+      vaos.forEach(v => gl3d.deleteVertexArray(v.vao));
       vaos.clear();
+      vbos.forEach(b => gl3d.deleteBuffer(b));
       vbos.length = 0;
+      rbos.forEach(r => gl3d.deleteRenderbuffer(r));
+      rbos.length = 0;
       texturePool.clearAll();
-      textures.forEach(t => gl3d.deleteTexture(t));
+      textures.forEach(t => {
+        if (t instanceof WebGLTexture) gl3d.deleteTexture(t);
+      });
       textures.clear();
+      
       vectors.clear();
     }
 
@@ -701,6 +698,7 @@
         gl3d.bindRenderbuffer(gl3d.RENDERBUFFER, rbo);
         gl3d.renderbufferStorage(gl3d.RENDERBUFFER, gl3d.DEPTH24_STENCIL8, W, H);
         gl3d.framebufferRenderbuffer(gl3d.FRAMEBUFFER, gl3d.DEPTH_STENCIL_ATTACHMENT, gl3d.RENDERBUFFER, rbo);
+        rbos.push(rbo);
       }
       else if (D === "TEXTURE") {
         // 可采样
@@ -825,10 +823,9 @@
       gl3d.bindVertexArray(null);
     }
 
-    async gl_Present() {
+    gl_Present() {
       if (skinId === null) return;
       try {
-        const bitmap = await createImageBitmap(canvas3d);
 
         const mainRenderer = vm.renderer;
         const mainGL = mainRenderer.gl;
@@ -837,21 +834,18 @@
         // 绑定 Scratch 的主纹理
         mainGL.bindTexture(mainGL.TEXTURE_2D, skin._texture);
 
-        // 禁用 Alpha
+        // 禁用 Alpha 预乘
         mainGL.pixelStorei(mainGL.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 
-        //  ImageBitmap 性能更高
+        // 直接将 Vapor3D 的 canvas3d 内容上传到 Scratch 的主纹理
         mainGL.texImage2D(
           mainGL.TEXTURE_2D,
           0,
           mainGL.RGBA,
           mainGL.RGBA,
           mainGL.UNSIGNED_BYTE,
-          bitmap
+          canvas3d
         );
-
-        bitmap.close();
-
         skin.emitWasAltered();
 
       } catch (e) {
@@ -870,15 +864,10 @@
 
       const texObject = textures.get(TEX);
 
-      // 如果ID无效或未找到，绑定null
-      if (texObject) {
+      if (texObject instanceof WebGLTexture) {
         gl3d.bindTexture(gl3d.TEXTURE_2D, texObject);
       } else {
-        // 如果 TEX 是null或无效ID，解绑
         gl3d.bindTexture(gl3d.TEXTURE_2D, null);
-        if (TEX !== "null") {
-          console.warn(`Vapor3D: Texture ID "${TEX}" not found or not loaded yet.`);
-        }
       }
     }
     tex_SetFilter({ TEX, MODE }) {
@@ -917,36 +906,49 @@
     tex_getCostumes() {
       return (vm.editingTarget ? vm.editingTarget.getCostumes() : []).map(c => c.name);
     }
-    tex_LoadFromCostume({ C }, { target }) {
-      if (texturePool.has(C)) return;
+    async tex_LoadFromCostume({ C, NAME }, { target }) {
+
+      if (textures.has(NAME)) return;
 
       const cost = target.sprite.costumes.find(c => c.name === C);
-      if (!cost) return;
-      const src = cost.asset.encodeDataURI();
-      const img = new Image();
-      img.src = src;
+      if (!cost) {
+        console.error(`Vapor3D: Costume [${C}] not found in sprite.`);
+        return;
+      }
 
-      texturePool.set(C, "loading", null);
+      textures.set(NAME, "loading");
 
-      img.onload = () => {
+      try {
+        // Uint8Array
+        const assetData = cost.asset.data;
+        const assetType = cost.asset.assetType.contentType;
+
+        // 二进制数据转 Blob
+        const blob = new Blob([assetData], { type: assetType });
+
+        // createImageBitmap 异步解码
+        const bitmap = await createImageBitmap(blob, {
+          premultiplyAlpha: 'none',
+          colorSpaceConversion: 'none'
+        });
+
         const tex = gl3d.createTexture();
         gl3d.bindTexture(gl3d.TEXTURE_2D, tex);
-
         gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
         gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
         gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.LINEAR);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
+        gl3d.texImage2D(gl3d.TEXTURE_2D, 0, gl3d.RGBA, gl3d.RGBA, gl3d.UNSIGNED_BYTE, bitmap);
 
-        gl3d.texImage2D(gl3d.TEXTURE_2D, 0, gl3d.RGBA, gl3d.RGBA, gl3d.UNSIGNED_BYTE, img);
+        bitmap.close();
 
-        const id = `tex_${C}_${Date.now()}`;
-        texturePool.set(C, id, tex);
-        textures.set(id, tex);
-      };
-    }
-    tex_GetId({ NAME }) {
-      const id = texturePool.getId(NAME);
-      if (!id || id === "loading") return "null";
-      return id;
+        textures.set(NAME, tex);
+        console.log(`Vapor3D: Texture [${NAME}] loaded successfully (Async).`);
+
+      } catch (e) {
+        textures.delete(NAME);
+        console.error(`Vapor3D: Failed to load texture [${NAME}]:`, e);
+      }
     }
     tex_Destroy({ NAME }) {
       const item = texturePool.cache.get(NAME);
@@ -1037,6 +1039,15 @@
     }
   }
 
-  runtime.on('PROJECT_LOADED', () => { (new Vapor3D()).gl_ResetResources(); });
-  Scratch.extensions.register(new Vapor3D());
+  const vapor3DInstance = new Vapor3D();
+
+  runtime.on('PROJECT_STOP_ALL', () => {
+    console.log("Vapor3D: Project stopped, clearing resources...");
+    vapor3DInstance.gl_ResetResources();
+  });
+  runtime.on('PROJECT_LOADED', () => {
+    vapor3DInstance.gl_ResetResources();
+  });
+
+  Scratch.extensions.register(vapor3DInstance);
 })(Scratch);
