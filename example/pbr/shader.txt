@@ -1,0 +1,292 @@
+Geo：
+————————————————————————————————————————
+
+#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aTexCoord;
+layout(location = 2) in vec3 aNormal;
+
+uniform mat4 uModel;
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+out vec2 vUv;
+out vec3 vNormal;
+out vec3 vWorldPos;
+
+void main() {
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vWorldPos = worldPos.xyz;
+    vUv = aTexCoord;
+    
+    vNormal = normalize(mat3(uModel) * aNormal);
+    
+    gl_Position = uProjection * uView * worldPos;
+}
+
+
+
+
+#version 300 es
+precision highp float;
+
+layout(location = 0) out vec4 gAlbedo;
+layout(location = 1) out vec4 gPosition;
+layout(location = 2) out vec4 gPbrTex;
+layout(location = 3) out vec4 gNormal;
+
+in vec2 vUv;
+in vec3 vNormal;
+in vec3 vWorldPos;
+
+uniform sampler2D albedo;
+uniform sampler2D pbrTex;
+uniform sampler2D normal;
+
+vec3 getNormalFromMap() {
+    vec3 tangentNormal = texture(normal, vUv).xyz * 2.0 - 1.0;
+    vec3 Q1  = dFdx(vWorldPos);
+    vec3 Q2  = dFdy(vWorldPos);
+    vec2 st1 = dFdx(vUv);
+    vec2 st2 = dFdy(vUv);
+
+    vec3 N   = normalize(vNormal);
+    vec3 T   = normalize(Q1*st2.t - Q2*st1.t);
+    vec3 B   = -normalize(cross(N, T));
+    mat3 TBN = mat3(T, B, N);
+
+    return normalize(TBN * tangentNormal);
+}
+
+void main() {
+    vec3 baseColor = texture(albedo, vUv).rgb;
+    gAlbedo = vec4(pow(baseColor, vec3(2.2)), 1.0); 
+
+    gPosition = vec4(vWorldPos, 1.0);
+ 
+    gNormal = vec4(getNormalFromMap(), 1.0);
+
+    gPbrTex = texture(pbrTex, vUv);
+}
+
+
+Lighting：
+————————————————————————————————————————
+#version 300 es
+precision highp float;
+
+layout(location = 0) out vec4 fragColor;
+in vec2 vUv;
+
+uniform sampler2D gAlbedo;   
+uniform sampler2D gPosition; 
+uniform sampler2D gPBR;
+uniform sampler2D gNormal;   
+
+
+uniform vec3 uCamPos;
+uniform vec3 uLightPos;
+uniform vec3 uLightColor;
+
+const float PI = 3.14159265359;
+
+float D_GGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denom = (NdotH * NdotH * (a2 - 1.0) + 1.0);
+    return a2 / (PI * denom * denom);
+}
+
+float G_Schlick(float NdotV, float NdotL, float roughness) {
+    float k = ((roughness + 1.0) * (roughness + 1.0)) / 8.0;
+    float g1v = NdotV / (NdotV * (1.0 - k) + k);
+    float g1l = NdotL / (NdotL * (1.0 - k) + k);
+    return g1v * g1l;
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+void main() {
+    vec4 posSample = texture(gPosition, vUv);
+    if (posSample.w < 0.1) discard;
+
+    vec3 worldPos = posSample.rgb;
+    vec3 N = normalize(texture(gNormal, vUv).rgb);
+    vec3 albedo = texture(gAlbedo, vUv).rgb;
+    vec4 pbr = texture(gPBR, vUv);
+    
+    float metallic = pbr.b;
+    float roughness = pbr.g;
+
+    vec3 V = normalize(uCamPos - worldPos);
+    vec3 L_unnorm = uLightPos - worldPos;
+    float distSq = dot(L_unnorm, L_unnorm);
+    vec3 L = normalize(L_unnorm);
+    vec3 H = normalize(V + L);
+
+    float NdotV = max(dot(N, V), 0.0001); 
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+
+    float attenuation = 1.0 / (distSq + 1.0); 
+    vec3 radiance = uLightColor * attenuation;
+
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 F = F_Schlick(HdotV, F0);
+    
+    float NDF = D_GGX(NdotH, roughness);
+    float G = G_Schlick(NdotV, NdotL, roughness);
+    
+    vec3 specular = (NDF * G * F) / (4.0 * NdotV * NdotL + 0.001);
+    
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    vec3 Lo = (kD * albedo / PI + specular) * radiance * NdotL;
+
+    vec3 color = albedo * 0.01 + Lo;
+
+    fragColor = vec4(color, 1.0);
+}
+
+
+
+Rain：
+————————————————————————————————————————
+#version 300 es
+precision highp float;
+
+layout(location = 0) out vec4 FragColor;
+
+in vec2 vUv;
+uniform sampler2D uInputTex;
+uniform float uTime;
+uniform vec2 uResolution;
+
+vec3 N13(float p) {
+   vec3 p3 = fract(vec3(p) * vec3(.1031,.11369,.13787));
+   p3 += dot(p3, p3.yzx + 19.19);
+   return fract(vec3((p3.x + p3.y)*p3.z, (p3.x+p3.z)*p3.y, (p3.y+p3.z)*p3.x));
+}
+
+float N(float t) {
+    return fract(sin(t*12345.564)*7658.76);
+}
+
+float Saw(float b, float t) {
+	return smoothstep(0., b, t)*smoothstep(1., b, t);
+}
+
+vec2 DropLayer(vec2 uv, float t) {
+    vec2 UV = uv;
+    uv.y += t*0.75;
+    vec2 a = vec2(6., 1.);
+    vec2 grid = a*2.;
+    vec2 id = floor(uv*grid);
+    float colShift = N(id.x); 
+    uv.y += colShift;
+    id = floor(uv*grid);
+    vec3 n = N13(id.x*35.2+id.y*2376.1);
+    vec2 st = fract(uv*grid)-vec2(.5, 0);
+    float x = n.x-.5;
+    float y = UV.y*20.;
+    float wiggle = sin(y+sin(y));
+    x += wiggle*(.5-abs(x))*(n.z-.5);
+    x *= .7;
+    float ti = fract(t+n.z);
+    y = (Saw(.85, ti)-.5)*.9+.5;
+    vec2 p = vec2(x, y);
+    float d = length((st-p)*a.yx);
+    float mainDrop = smoothstep(.4, .0, d);
+    float r = sqrt(smoothstep(1., y, st.y));
+    float cd = abs(st.x-x);
+    float trail = smoothstep(.23*r, .15*r*r, cd);
+    float trailFront = smoothstep(-.02, .02, st.y-y);
+    trail *= trailFront*r*r;
+    y = UV.y;
+    float trail2 = smoothstep(.2*r, .0, cd);
+    float droplets = max(0., (sin(y*(1.-y)*120.)-st.y))*trail2*trailFront*n.z;
+    y = fract(y*10.)+(st.y-.5);
+    float dd = length(st-vec2(x, y));
+    droplets = smoothstep(.3, 0., dd);
+    float m = mainDrop+droplets*r*trailFront;
+    return vec2(m, trail);
+}
+
+float StaticDrops(vec2 uv, float t) {
+	uv *= 40.;
+    vec2 id = floor(uv);
+    uv = fract(uv)-.5;
+    vec3 n = N13(id.x*107.45+id.y*3543.654);
+    vec2 p = (n.xy-.5)*.7;
+    float d = length(uv-p);
+    float fade = Saw(.025, fract(t+n.z));
+    return smoothstep(.3, 0., d)*fract(n.z*10.)*fade;
+}
+
+vec2 GetDrops(vec2 uv, float t) {
+    float s = StaticDrops(uv, t); 
+    vec2 m1 = DropLayer(uv, t);
+    vec2 m2 = DropLayer(uv*1.85, t);
+    float c = s + m1.x + m2.x;
+    c = smoothstep(.3, 1., c);
+    return vec2(c, max(m1.y, m2.y));
+}
+
+void main() {
+    vec2 uv = (vUv - 0.5);
+    uv.x *= uResolution.x / uResolution.y;
+    float t = uTime * 0.2;
+    
+    vec2 drops = GetDrops(uv, t);
+    
+    vec2 e = vec2(.001, 0.);
+    float cx = GetDrops(uv+e, t).x;
+    float cy = GetDrops(uv+e.yx, t).x;
+    vec2 n = vec2(cx-drops.x, cy-drops.x);
+    
+    float focus = mix(4.0, 0.0, smoothstep(.1, .2, drops.x));
+    
+    vec2 finalUv = vUv + n;
+    vec3 col = texture(uInputTex, finalUv).rgb;
+    
+    FragColor = vec4(col, 1.0);
+}
+
+
+Final：
+————————————————————————————————————————
+#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aTexCoord;
+
+out vec2 vUv;
+
+void main() {
+    vUv = aTexCoord;
+    gl_Position = vec4(aPos, 1.0);
+}
+
+
+
+
+#version 300 es
+precision highp float;
+
+in vec2 vUv;
+
+uniform sampler2D color;
+uniform float uGamma;
+
+out vec4 FragColor;
+
+void main() {
+
+vec4 texColor = texture(color, vUv);
+
+    texColor.rgb = pow(texColor.rgb, vec3(1.0 / uGamma));
+    
+    FragColor = texColor;
+  
+}
