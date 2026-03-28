@@ -1,9 +1,9 @@
-// Name: Vapor3D
+// Name: Vapor 3D
 // ID: vapor3D
 // Description: 3D Engine for Turbowarp
 // By: Joy_Ful <https://github.com/JoyFul114514>
 // License: MPL-2.0 AND BSD-3-Clause
-// Version: 1.0.0
+// Version: 1.1.0 - HDR
 
 (function (Scratch) {
   "use strict";
@@ -15,14 +15,16 @@
   const runtime = vm.runtime;
 
   // ==========================================
-  // 独立 WebGL2 上下文
+  // 独立 WebGL
   // ==========================================
+  let originalDraw = null;
+  let isTakenOver = false;
   const canvas3d = document.createElement('canvas');
   const gl3d = canvas3d.getContext('webgl2', {
     alpha: true,
     depth: true,
     stencil: true,
-    antialias: true,
+    antialias: false,
     preserveDrawingBuffer: true,
     powerPreference: 'high-performance'
   });
@@ -35,6 +37,54 @@
     console.log(renderer);
   }
 
+  // ==========================================
+  // 独立 Canvas3d
+  // ==========================================
+  const shaders = new Map();
+  const vaos = new Map();
+  const fbos = new Map();
+  const textures = new Map();
+  const vbos = [];
+  const rbos = [];
+
+  const vectors = new Map();
+
+
+  function updateCanvasSize() {
+    canvas3d.width = renderer.canvas.width;
+    canvas3d.height = renderer.canvas.height;
+    if (gl3d) gl3d.viewport(0, 0, canvas3d.width, canvas3d.height);
+  }
+
+  function initCanvasOverlay() {
+    const mainCanvas = renderer.canvas;
+    if (!mainCanvas) return;
+    const container = mainCanvas.parentElement;
+    if (!container) return;
+
+    canvas3d.style.position = 'absolute';
+    canvas3d.style.left = '0';
+    canvas3d.style.top = '0';
+    canvas3d.style.width = '100%';
+    canvas3d.style.height = '100%';
+    canvas3d.style.pointerEvents = 'none';
+    canvas3d.style.imageRendering = 'pixelated';
+
+    // zIndex 排序
+    canvas3d.style.zIndex = '1';
+
+    if (container.style.position !== 'relative' && container.style.position !== 'absolute') {
+      container.style.position = 'relative';
+    }
+
+    if (!canvas3d.parentElement) {
+      container.appendChild(canvas3d);
+    }
+  }
+
+  // ==========================================
+  // m4
+  // ==========================================
   const m4 = {
     identity: () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
     perspective: (fovy, aspect, near, far) => {
@@ -121,53 +171,6 @@
   };
 
   // ==========================================
-  // 独立图层管理
-  // ==========================================
-  const shaders = new Map();
-  const vaos = new Map();
-  const fbos = new Map();
-  const textures = new Map();
-  const vbos = [];
-  const rbos = [];
-
-  const vectors = new Map();
-
-  let skinId = null;
-  let drawableId = null;
-
-  function updateCanvasSize() {
-    canvas3d.width = renderer.canvas.width;
-    canvas3d.height = renderer.canvas.height;
-    if (gl3d) gl3d.viewport(0, 0, canvas3d.width, canvas3d.height);
-  }
-
-  function setupLayer() {
-    if (skinId !== null) return;
-    const mainRenderer = vm.renderer;
-    updateCanvasSize();
-
-    let index = mainRenderer._groupOrdering.indexOf("video");
-    mainRenderer._groupOrdering.splice(index + 1, 0, "vapor3D");
-    mainRenderer._layerGroups["vapor3D"] = {
-      groupIndex: 0,
-      drawListOffset: mainRenderer._layerGroups["video"].drawListOffset,
-    };
-    for (let i = 0; i < mainRenderer._groupOrdering.length; i++) {
-      mainRenderer._layerGroups[mainRenderer._groupOrdering[i]].groupIndex = i;
-    }
-
-    skinId = mainRenderer.createBitmapSkin(new ImageData(canvas3d.width, canvas3d.height));
-    drawableId = mainRenderer.createDrawable("vapor3D");
-    mainRenderer.updateDrawableSkinId(drawableId, skinId);
-
-    // 全屏对齐，也可通过积木修改
-    const skin = mainRenderer._allSkins[skinId];
-    if (skin.setNativeSize) skin.setNativeSize(canvas3d.width, canvas3d.height);
-    mainRenderer.updateDrawablePosition(drawableId, [0, 0]);
-    mainRenderer.updateDrawableScale(drawableId, [200, 200]);
-  }
-
-  // ==========================================
   // 通用
   // ==========================================
 
@@ -208,6 +211,162 @@
 
     return lists;
   }
+
+  const _parseHDR = (buffer) => {
+    const bytes = new Uint8Array(buffer);
+
+    // Header
+    let header = "";
+    let offset = 0;
+    while (offset < bytes.length) {
+      let line = "";
+      while (offset < bytes.length && bytes[offset] !== 10) { // 查找 \n
+        line += String.fromCharCode(bytes[offset++]);
+      }
+      offset++; // 跳过 \n
+      if (line.trim() === "") break; // 空行，元数据部分结束
+      header += line + "\n";
+    }
+
+    // 分辨率行
+    let resLine = "";
+    while (offset < bytes.length && bytes[offset] !== 10) {
+      resLine += String.fromCharCode(bytes[offset++]);
+    }
+    offset++; // \n
+
+    const resMatch = resLine.match(/[+-]Y\s+(\d+)\s+[+-]X\s+(\d+)/);
+    if (!resMatch) {
+      console.error("Failed resolution line:", resLine);
+      throw new Error("Invalid HDR header: Resolution line not found or malformed");
+    }
+
+    const height = parseInt(resMatch[1]);
+    const width = parseInt(resMatch[2]);
+
+    // 3. 解码 RLE
+    const floatData = new Float32Array(width * height * 3);
+    const scanlineRGBE = new Uint8Array(width * 4);
+    let floatOffset = 0;
+
+    for (let y = 0; y < height; y++) {
+      if (offset + 4 > bytes.length) break;
+
+      const rgbe = bytes.subarray(offset, offset + 4);
+      offset += 4;
+
+      // 检查是否为现代 RLE 格式
+      if (rgbe[0] !== 2 || rgbe[1] !== 2 || (rgbe[2] & 0x80)) {
+        throw new Error("Only modern RLE HDR is supported. This file uses an older or incompatible format.");
+      }
+
+      const lineLen = (rgbe[2] << 8) | rgbe[3];
+      if (lineLen !== width) throw new Error("Scanline length mismatch");
+
+      // R, G, B, E
+      for (let i = 0; i < 4; i++) {
+        let ptr = i * width;
+        const endPtr = (i + 1) * width;
+        while (ptr < endPtr) {
+          const code = bytes[offset++];
+          if (code > 128) { // Run: 接下来一个字节重复 (code-128) 次
+            const count = code - 128;
+            const val = bytes[offset++];
+            for (let j = 0; j < count; j++) scanlineRGBE[ptr++] = val;
+          } else { // Literal: 接下来读取 code 个字节
+            const count = code;
+            for (let j = 0; j < count; j++) scanlineRGBE[ptr++] = bytes[offset++];
+          }
+        }
+      }
+
+      // RGBE 转换为浮点数
+      for (let x = 0; x < width; x++) {
+        const r = scanlineRGBE[x];
+        const g = scanlineRGBE[x + width];
+        const b = scanlineRGBE[x + 2 * width];
+        const e = scanlineRGBE[x + 3 * width];
+
+        if (e > 0) {
+          // 这里的 pow(2, e-128) / 256 是 RGBE 转换公式
+          const f = Math.pow(2.0, e - (128 + 8));
+          floatData[floatOffset++] = r * f;
+          floatData[floatOffset++] = g * f;
+          floatData[floatOffset++] = b * f;
+        } else {
+          floatData[floatOffset++] = 0;
+          floatData[floatOffset++] = 0;
+          floatData[floatOffset++] = 0;
+        }
+      }
+    }
+
+    return { width, height, data: floatData };
+  };
+  const _parseKTX = (buffer) => {
+    const bytes = new Uint8Array(buffer);
+    const identifier = [0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A];
+    for (let i = 0; i < 12; i++) {
+      if (bytes[i] !== identifier[i]) throw new Error("Not a valid KTX 1.0 file");
+    }
+
+    const dv = new DataView(buffer);
+    // 判断字节序 (0x04030201 means little endian)
+    const littleEndian = dv.getUint32(12, true) === 0x04030201;
+
+    // 读取 WebGL 枚举和尺寸
+    const glType = dv.getUint32(16, littleEndian);
+    const glFormat = dv.getUint32(24, littleEndian);
+    const glInternalFormat = dv.getUint32(28, littleEndian);
+
+    const pixelWidth = dv.getUint32(36, littleEndian);
+    const pixelHeight = dv.getUint32(40, littleEndian);
+    const numberOfFaces = dv.getUint32(52, littleEndian);
+    let numberOfMipmapLevels = dv.getUint32(56, littleEndian);
+    const bytesOfKeyValueData = dv.getUint32(60, littleEndian);
+
+    if (numberOfFaces !== 6) throw new Error("Vapor3D: KTX must be a Cubemap (6 faces).");
+    if (numberOfMipmapLevels === 0) numberOfMipmapLevels = 1;
+
+    let offset = 64 + bytesOfKeyValueData;
+    const mipmaps = [];
+
+    // 循环提取所有的 Mipmap 和 面
+    for (let mip = 0; mip < numberOfMipmapLevels; mip++) {
+      const imageSize = dv.getUint32(offset, littleEndian); // 每个面的数据大小
+      offset += 4;
+
+      for (let face = 0; face < numberOfFaces; face++) {
+        // 提取该面该层级的二进制数据切片
+        const faceBuffer = buffer.slice(offset, offset + imageSize);
+
+        // 根据 glType 转换为对应的 TypedArray (FLOAT=5126, HALF_FLOAT=5131/36193, UNSIGNED_BYTE=5121)
+        let dataArray;
+        if (glType === 5126) {
+          dataArray = new Float32Array(faceBuffer);
+        } else if (glType === 5131 || glType === 36193) {
+          dataArray = new Uint16Array(faceBuffer);
+        } else {
+          dataArray = new Uint8Array(faceBuffer);
+        }
+
+        mipmaps.push({
+          level: mip,
+          face: face, // 0 到 5，对应 WebGL 的 POSITIVE_X 到 NEGATIVE_Z
+          width: Math.max(1, pixelWidth >> mip),
+          height: Math.max(1, pixelHeight >> mip),
+          data: dataArray
+        });
+
+        offset += imageSize;
+        // KTX 要求每个面在 4 字节边界对齐
+        const padding = 3 - ((imageSize + 3) % 4);
+        offset += padding;
+      }
+    }
+
+    return { glInternalFormat, glFormat, glType, numberOfMipmapLevels, mipmaps };
+  };
   // ==========================================
   // 纹理池
   // ==========================================
@@ -255,24 +414,6 @@
           { opcode: "gl_Init", blockType: "command", text: "init WebGL" },
           { opcode: "gl_ResetResources", blockType: "command", text: "reset all" },
           { opcode: "gl_Clear", blockType: "command", text: "glClear [BIT]", arguments: { BIT: { type: "string", menu: "clearMenu" } } },
-          {
-            opcode: "gl_SetResolution",
-            blockType: "command",
-            text: "set canvas resolution [W] x [H]",
-            arguments: {
-              W: { type: "number", defaultValue: 480 },
-              H: { type: "number", defaultValue: 360 }
-            }
-          },
-          {
-            opcode: "gl_SetLayerScale",
-            blockType: "command",
-            text: "set canvas scale X [SX]% Y [SY]%",
-            arguments: {
-              SX: { type: "number", defaultValue: 100 },
-              SY: { type: "number", defaultValue: 100 }
-            }
-          },
           {
             opcode: "gl_SetClearColor",
             blockType: "command",
@@ -360,10 +501,28 @@
           {
             opcode: "tex_LoadFromCostume",
             blockType: "command",
-            text: "load costume [C] as texture [NAME]",
+            text: "load texture [NAME] from costume [C]",
             arguments: {
               C: { type: "string", menu: "costumeMenu" },
               NAME: { type: "string", defaultValue: "tex1" }
+            }
+          },
+          {
+            opcode: "tex_LoadFromURL",
+            blockType: "command",
+            text: "load texture [NAME] from URL [U]",
+            arguments: {
+              U: { type: "string", defaultValue: "https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/uv_grid_opengl.jpg" },
+              NAME: { type: "string", defaultValue: "texURL1" }
+            }
+          },
+          {
+            opcode: "tex_LoadKTXToCubemap",
+            blockType: "command",
+            text: "load uncompressed KTX Cubemap [NAME] from URL [U]",
+            arguments: {
+              U: { type: "string", defaultValue: "https://example.com/prefilter.ktx" },
+              NAME: { type: "string", defaultValue: "prefilterMap" }
             }
           },
           {
@@ -485,53 +644,64 @@
     }
 
     gl_Init() {
-      setupLayer();
-      const ext = gl3d.getExtension('EXT_color_buffer_float');
-      if (!ext) {
-        console.error("Vapor3D: 此设备不支持RGBA16F");
-      }
+      initCanvasOverlay();
+      canvas3d.style.display = 'block'; // 显示
+
+      // 同步一次物理分辨率
+      const mainCanvas = renderer.canvas;
+      canvas3d.width = mainCanvas.width;
+      canvas3d.height = mainCanvas.height;
+      gl3d.viewport(0, 0, canvas3d.width, canvas3d.height);
+
       gl3d.enable(gl3d.DEPTH_TEST);
       gl3d.enable(gl3d.STENCIL_TEST);
-    }
 
-    gl_SetResolution({ W, H }) {
-      if (!gl3d || skinId === null) return;
+      gl3d.getExtension('OES_texture_float_linear');
+      const ext = gl3d.getExtension('EXT_color_buffer_float');
 
-      canvas3d.width = W;
-      canvas3d.height = H;
-      gl3d.viewport(0, 0, W, H);
-
-      // 通知 Scratch 渲染器更新皮肤
-      const skin = renderer._allSkins[skinId];
-      if (skin && skin.setNativeSize) {
-        skin.setNativeSize(W, H);
+      // 劫持原有画布，禁用渲染
+      if (!originalDraw) {
+        originalDraw = renderer.draw.bind(renderer);
+        renderer.draw = () => {
+          if (isTakenOver) return;
+          originalDraw();
+        };
       }
+      isTakenOver = true;
 
+      // 测试
+      // gl3d.clearColor(1, 0, 0, 1); gl3d.clear(gl3d.COLOR_BUFFER_BIT);
     }
 
-    gl_SetLayerScale({ SX, SY }) {
-      if (drawableId === null) return;
-      renderer.updateDrawableScale(drawableId, [SX, SY]);
-    }
 
     gl_ResetResources() {
+      if (!gl3d) return;
+
       shaders.forEach(p => gl3d.deleteProgram(p));
       shaders.clear();
-      fbos.forEach(f => gl3d.deleteFramebuffer(f));
+
+      fbos.forEach(entry => {
+        if (entry && entry.fbo) gl3d.deleteFramebuffer(entry.fbo);
+      });
       fbos.clear();
+
       vaos.forEach(v => gl3d.deleteVertexArray(v.vao));
       vaos.clear();
+
       vbos.forEach(b => gl3d.deleteBuffer(b));
       vbos.length = 0;
       rbos.forEach(r => gl3d.deleteRenderbuffer(r));
       rbos.length = 0;
+
       texturePool.clearAll();
       textures.forEach(t => {
         if (t instanceof WebGLTexture) gl3d.deleteTexture(t);
       });
       textures.clear();
-      
+
       vectors.clear();
+
+      console.log("Vapor3D: All resources have been released");
     }
 
     gl_Clear({ BIT }) {
@@ -644,8 +814,8 @@
       // 格式映射表
       const formatMap = {
         // HDR
-        "RGB16F": { internal: gl3d.RGB16F, format: gl3d.RGB, type: gl3d.HALF_FLOAT },
-        "RGBA16F": { internal: gl3d.RGBA16F, format: gl3d.RGBA, type: gl3d.HALF_FLOAT },
+        "RGB16F": { internal: gl3d.RGB16F, format: gl3d.RGB, type: gl3d.HALF_FLOAT }, // 不知道为啥，我的电脑无法用RGB16F
+        "RGBA16F": { internal: gl3d.RGBA16F, format: gl3d.RGBA, type: gl3d.HALF_FLOAT }, 
         "RGB32F": { internal: gl3d.RGB32F, format: gl3d.RGB, type: gl3d.FLOAT },
 
         // 标准 LDR (8位)
@@ -729,11 +899,22 @@
         console.error(`Vapor3D: FBO "${ID}" is incomplete! Status: ${status}`);
       }
 
-      fbos.set(ID, fbo);
+      fbos.set(ID, { fbo, width: W, height: H }); // 保存 W 和 H 便于绑定到 fbo0 时对齐
       gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, null);
     }
 
-    fbo_Bind({ ID }) { gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, fbos.get(ID) || null); }
+    fbo_Bind({ ID }) {
+      const entry = fbos.get(ID);
+      if (entry) {
+        // 渲染到 FBO：viewport 为 FBO 大小
+        gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, entry.fbo);
+        gl3d.viewport(0, 0, entry.width, entry.height);
+      } else {
+        // 渲染到屏幕：视口设为 canvas3d 的物理大小
+        gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, null);
+        gl3d.viewport(0, 0, canvas3d.width, canvas3d.height);
+      }
+    }
 
     vao_CreateScreenQuad({ ID }) {
       if (vaos.has(ID)) return;
@@ -824,34 +1005,20 @@
     }
 
     gl_Present() {
-      if (skinId === null) return;
-      try {
+      if (!gl3d) return;
 
-        const mainRenderer = vm.renderer;
-        const mainGL = mainRenderer.gl;
-        const skin = mainRenderer._allSkins[skinId];
-
-        // 绑定 Scratch 的主纹理
-        mainGL.bindTexture(mainGL.TEXTURE_2D, skin._texture);
-
-        // 禁用 Alpha 预乘
-        mainGL.pixelStorei(mainGL.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-
-        // 直接将 Vapor3D 的 canvas3d 内容上传到 Scratch 的主纹理
-        mainGL.texImage2D(
-          mainGL.TEXTURE_2D,
-          0,
-          mainGL.RGBA,
-          mainGL.RGBA,
-          mainGL.UNSIGNED_BYTE,
-          canvas3d
-        );
-        skin.emitWasAltered();
-
-      } catch (e) {
-        console.error("Vapor3D: Frame transfer failed", e);
+      // 同步物理分辨率
+      const mainCanvas = renderer.canvas;
+      if (canvas3d.width !== mainCanvas.width || canvas3d.height !== mainCanvas.height) {
+        canvas3d.width = mainCanvas.width;
+        canvas3d.height = mainCanvas.height;
+        gl3d.viewport(0, 0, canvas3d.width, canvas3d.height);
       }
 
+      // 强制执行所有待处理的 WebGL 指令
+      gl3d.flush();
+
+      // 告诉 Scratch 这一帧渲染完了
       runtime.requestRedraw();
     }
 
@@ -934,8 +1101,8 @@
 
         const tex = gl3d.createTexture();
         gl3d.bindTexture(gl3d.TEXTURE_2D, tex);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.REPEAT);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.REPEAT);
         gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.LINEAR);
         gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
         gl3d.texImage2D(gl3d.TEXTURE_2D, 0, gl3d.RGBA, gl3d.RGBA, gl3d.UNSIGNED_BYTE, bitmap);
@@ -948,6 +1115,96 @@
       } catch (e) {
         textures.delete(NAME);
         console.error(`Vapor3D: Failed to load texture [${NAME}]:`, e);
+      }
+    }
+    async tex_LoadFromURL({ U, NAME }) {
+      if (textures.has(NAME)) return;
+
+      textures.set(NAME, "loading");
+
+      try {
+        const response = await fetch(U);
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+        const blob = await response.blob();
+
+        const bitmap = await createImageBitmap(blob, {
+          premultiplyAlpha: 'none',
+          colorSpaceConversion: 'none'
+        });
+
+        const tex = gl3d.createTexture();
+        gl3d.bindTexture(gl3d.TEXTURE_2D, tex);
+
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.REPEAT);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.REPEAT);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.LINEAR);
+        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
+
+        gl3d.texImage2D(gl3d.TEXTURE_2D, 0, gl3d.RGBA, gl3d.RGBA, gl3d.UNSIGNED_BYTE, bitmap);
+
+        bitmap.close();
+        textures.set(NAME, tex);
+
+        console.log(`Vapor3D: Texture [${NAME}] loaded from URL successfully.`);
+      } catch (e) {
+        textures.delete(NAME);
+        console.error(`Vapor3D: Failed to load URL texture [${NAME}]:`, e);
+      }
+    }
+    async tex_LoadKTXToCubemap({ U, NAME }) {
+      if (textures.has(NAME)) return;
+      const url = String(U).trim();
+
+      textures.set(NAME, "loading");
+      console.log(`Vapor3D: Loading KTX Cubemap from ${url}...`);
+
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const buffer = await response.arrayBuffer();
+
+        // 1. 调用外部解析器
+        const ktx = _parseKTX(buffer);
+
+        // 2. 初始化 Cubemap 纹理
+        const tex = gl3d.createTexture();
+        gl3d.bindTexture(gl3d.TEXTURE_CUBE_MAP, tex);
+
+        // 确保 WebGL 支持对浮点数进行线性过滤 (非常重要)
+        gl3d.getExtension('OES_texture_float_linear');
+        gl3d.getExtension('OES_texture_half_float_linear');
+        gl3d.getExtension('EXT_color_buffer_float');
+
+        // 3. 循环上传 30 个数据块 (6面 * 5层)
+        ktx.mipmaps.forEach(mip => {
+          const target = gl3d.TEXTURE_CUBE_MAP_POSITIVE_X + mip.face;
+          gl3d.texImage2D(
+            target,
+            mip.level,
+            ktx.glInternalFormat, // KTX 文件已经自带了正确的格式枚举 (例如 gl.RGBA16F)
+            mip.width,
+            mip.height,
+            0,
+            ktx.glFormat,
+            ktx.glType,
+            mip.data
+          );
+        });
+
+        // Cubemap 过滤
+        const hasMipmaps = ktx.numberOfMipmapLevels > 1;
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MIN_FILTER, hasMipmaps ? gl3d.LINEAR_MIPMAP_LINEAR : gl3d.LINEAR);
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_R, gl3d.CLAMP_TO_EDGE);
+
+        textures.set(NAME, tex);
+        console.log(`Vapor3D: KTX Cubemap [${NAME}] loaded successfully. Levels: ${ktx.numberOfMipmapLevels}`);
+      } catch (e) {
+        textures.delete(NAME);
+        console.error(`Vapor3D: KTX Cubemap load failed:`, e);
       }
     }
     tex_Destroy({ NAME }) {
@@ -1042,7 +1299,9 @@
   const vapor3DInstance = new Vapor3D();
 
   runtime.on('PROJECT_STOP_ALL', () => {
-    console.log("Vapor3D: Project stopped, clearing resources...");
+    console.log("Vapor3D: Project stopped, clearing resources...: Project stopped.");
+    isTakenOver = false;
+    if (canvas3d) canvas3d.style.display = 'none';
     vapor3DInstance.gl_ResetResources();
   });
   runtime.on('PROJECT_LOADED', () => {

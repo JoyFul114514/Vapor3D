@@ -1,6 +1,5 @@
 Geo：
 ————————————————————————————————————————
-
 #version 300 es
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aTexCoord;
@@ -32,7 +31,7 @@ precision highp float;
 
 layout(location = 0) out vec4 gAlbedo;
 layout(location = 1) out vec4 gPosition;
-layout(location = 2) out vec4 gPbrTex;
+layout(location = 2) out vec4 gPBR;
 layout(location = 3) out vec4 gNormal;
 
 in vec2 vUv;
@@ -40,8 +39,10 @@ in vec3 vNormal;
 in vec3 vWorldPos;
 
 uniform sampler2D albedo;
-uniform sampler2D pbrTex;
+uniform sampler2D pbr;
 uniform sampler2D normal;
+
+uniform float uGamma;
 
 vec3 getNormalFromMap() {
     vec3 tangentNormal = texture(normal, vUv).xyz * 2.0 - 1.0;
@@ -60,14 +61,16 @@ vec3 getNormalFromMap() {
 
 void main() {
     vec3 baseColor = texture(albedo, vUv).rgb;
-    gAlbedo = vec4(pow(baseColor, vec3(2.2)), 1.0); 
+    gAlbedo = vec4(pow(baseColor, vec3(uGamma)), 1.0); 
 
     gPosition = vec4(vWorldPos, 1.0);
  
-    gNormal = vec4(getNormalFromMap(), 1.0);
+    vec3 normal = getNormalFromMap();
+    gNormal = vec4(normal * 0.5 + 0.5, 1.0); 
 
-    gPbrTex = texture(pbrTex, vUv);
+    gPBR = texture(pbr, vUv);
 }
+
 
 
 Lighting：
@@ -113,7 +116,7 @@ void main() {
     if (posSample.w < 0.1) discard;
 
     vec3 worldPos = posSample.rgb;
-    vec3 N = normalize(texture(gNormal, vUv).rgb);
+    vec3 N = normalize(texture(gNormal, vUv).rgb * 2.0 - 1.0);
     vec3 albedo = texture(gAlbedo, vUv).rgb;
     vec4 pbr = texture(gPBR, vUv);
     
