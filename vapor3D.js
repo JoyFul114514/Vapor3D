@@ -3,7 +3,7 @@
 // Description: 3D Engine for Turbowarp
 // By: Joy_Ful <https://github.com/JoyFul114514>
 // License: MPL-2.0 AND BSD-3-Clause
-// Version: 1.1.0 - HDR
+// Version: 1.2.0 - Added Irradiance Map support
 
 (function (Scratch) {
   "use strict";
@@ -70,15 +70,15 @@
     canvas3d.style.pointerEvents = 'none';
     canvas3d.style.imageRendering = 'pixelated';
 
-    // zIndex 排序
-    canvas3d.style.zIndex = '1';
+    // zIndex 排序，0不会覆盖变量
+    canvas3d.style.zIndex = '0';
 
     if (container.style.position !== 'relative' && container.style.position !== 'absolute') {
       container.style.position = 'relative';
     }
 
     if (!canvas3d.parentElement) {
-      container.appendChild(canvas3d);
+      mainCanvas.after(canvas3d);
     }
   }
 
@@ -212,6 +212,23 @@
     return lists;
   }
 
+  const _getFormatConfig = (formatStr) => {
+    const gl = gl3d;
+    const formatMap = {
+      "RGB16F": { internal: gl.RGB16F, format: gl.RGB, type: gl.HALF_FLOAT },
+      "RGBA16F": { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT },
+      "RGB32F": { internal: gl.RGB32F, format: gl.RGB, type: gl.FLOAT },
+      "RGB8": { internal: gl.RGB8, format: gl.RGB, type: gl.UNSIGNED_BYTE },
+      "RGBA8": { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE },
+      "R11G11B10F": { internal: gl.R11F_G11F_B10F, format: gl.RGB, type: gl.FLOAT },
+      "R16F": { internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT },
+      "RG16F": { internal: gl.RG16F, format: gl.RG, type: gl.HALF_FLOAT },
+      "DEPTH24_STENCIL8": { internal: gl.DEPTH24_STENCIL8, format: gl.DEPTH_STENCIL, type: gl.UNSIGNED_INT_24_8 },
+      "DEPTH_COMPONENT24": { internal: gl.DEPTH_COMPONENT24, format: gl.DEPTH_COMPONENT, type: gl.UNSIGNED_INT }
+      };
+    return formatMap[formatStr] || formatMap["RGB8"];
+  }
+
   const _parseHDR = (buffer) => {
     const bytes = new Uint8Array(buffer);
 
@@ -305,16 +322,17 @@
   };
   const _parseKTX = (buffer) => {
     const bytes = new Uint8Array(buffer);
+
+    // KTX 1.0 标识符
     const identifier = [0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A];
     for (let i = 0; i < 12; i++) {
-      if (bytes[i] !== identifier[i]) throw new Error("Not a valid KTX 1.0 file");
+      if (bytes[i] !== identifier[i]) throw new Error("Vapor3D: Not a valid KTX 1.0 file");
     }
 
     const dv = new DataView(buffer);
-    // 判断字节序 (0x04030201 means little endian)
+    // 2. 确定字节序 0x04030201 小端
     const littleEndian = dv.getUint32(12, true) === 0x04030201;
 
-    // 读取 WebGL 枚举和尺寸
     const glType = dv.getUint32(16, littleEndian);
     const glFormat = dv.getUint32(24, littleEndian);
     const glInternalFormat = dv.getUint32(28, littleEndian);
@@ -325,22 +343,27 @@
     let numberOfMipmapLevels = dv.getUint32(56, littleEndian);
     const bytesOfKeyValueData = dv.getUint32(60, littleEndian);
 
-    if (numberOfFaces !== 6) throw new Error("Vapor3D: KTX must be a Cubemap (6 faces).");
+    if (numberOfFaces !== 6) {
+      throw new Error("Vapor3D: KTX parsing error. Expected a Cubemap (6 faces), but got " + numberOfFaces);
+    }
+
+    // 如果没有开启 Mipmap，KTX 文件中该值为 0，视为 1 层
     if (numberOfMipmapLevels === 0) numberOfMipmapLevels = 1;
 
-    let offset = 64 + bytesOfKeyValueData;
+    let offset = 64 + bytesOfKeyValueData; // 数据块的起始位置
     const mipmaps = [];
 
-    // 循环提取所有的 Mipmap 和 面
     for (let mip = 0; mip < numberOfMipmapLevels; mip++) {
-      const imageSize = dv.getUint32(offset, littleEndian); // 每个面的数据大小
+      const imageSize = dv.getUint32(offset, littleEndian);
       offset += 4;
 
       for (let face = 0; face < numberOfFaces; face++) {
-        // 提取该面该层级的二进制数据切片
+        // 提取二进制切片
         const faceBuffer = buffer.slice(offset, offset + imageSize);
 
-        // 根据 glType 转换为对应的 TypedArray (FLOAT=5126, HALF_FLOAT=5131/36193, UNSIGNED_BYTE=5121)
+        // 5126 = gl.FLOAT
+        // 5131 = gl.HALF_FLOAT (WebGL2), 36193 = gl.HALF_FLOAT_OES (WebGL1)
+        // 5121 = gl.UNSIGNED_BYTE
         let dataArray;
         if (glType === 5126) {
           dataArray = new Float32Array(faceBuffer);
@@ -352,17 +375,20 @@
 
         mipmaps.push({
           level: mip,
-          face: face, // 0 到 5，对应 WebGL 的 POSITIVE_X 到 NEGATIVE_Z
+          face: face,
           width: Math.max(1, pixelWidth >> mip),
           height: Math.max(1, pixelHeight >> mip),
           data: dataArray
         });
 
         offset += imageSize;
-        // KTX 要求每个面在 4 字节边界对齐
-        const padding = 3 - ((imageSize + 3) % 4);
-        offset += padding;
+
+        // KTX 要求每个面数据后都要按 4 字节对齐
+        offset = (offset + 3) & ~3;
       }
+
+      // Padding
+      offset = (offset + 3) & ~3;
     }
 
     return { glInternalFormat, glFormat, glType, numberOfMipmapLevels, mipmaps };
@@ -459,19 +485,15 @@
           "---",
           { blockType: "label", text: "Framebuffer" },
 
+          { opcode: "fbo_Create", blockType: "command", text: "create FBO [ID]", arguments: { ID: { type: "string", defaultValue: "fbo1" } } },
           {
-            opcode: "fbo_Create",
+            opcode: "fbo_AttachTexture",
             blockType: "command",
-            text: "create FBO [ID] size [W]x[H] Slot0 [A0] Slot1 [A1] Slot2 [A2] Slot3 [A3] Depth [D]",
+            text: "FBO [ID] attach texture [TEX] to [SLOT]",
             arguments: {
               ID: { type: "string", defaultValue: "fbo1" },
-              W: { type: "number", defaultValue: 480 },
-              H: { type: "number", defaultValue: 360 },
-              A0: { type: "string", menu: "fboTypeMenu", defaultValue: "RGBA8" },
-              A1: { type: "string", menu: "fboTypeMenu", defaultValue: "NONE" },
-              A2: { type: "string", menu: "fboTypeMenu", defaultValue: "NONE" },
-              A3: { type: "string", menu: "fboTypeMenu", defaultValue: "NONE" },
-              D: { type: "string", menu: "depthMenu", defaultValue: "RBO" }
+              TEX: { type: "string", defaultValue: "renderTarget1" },
+              SLOT: { type: "string", menu: "fboSlotMenu", defaultValue: "COLOR_ATTACHMENT0" }
             }
           },
           { opcode: "fbo_Bind", blockType: "command", text: "glBindFramebuffer [ID]", arguments: { ID: { type: "string" } } },
@@ -480,7 +502,7 @@
           { blockType: "label", text: "Vertex Array Object" },
 
           { opcode: "vao_CreateScreenQuad", blockType: "command", text: "Init RenderQuad [ID]", arguments: { ID: { type: "string", defaultValue: "screenQuad" } } },
-
+          { opcode: "vao_CreateCube", blockType: "command", text: "Init Cube [ID]", arguments: { ID: { type: "string", defaultValue: "cube" } } },
           {
             opcode: "vao_CreateCustom",
             blockType: "command",
@@ -498,6 +520,17 @@
           "---",
           { blockType: "label", text: "Texture" },
 
+          {
+            opcode: "tex_CreateEmpty",
+            blockType: "command",
+            text: "create empty texture [NAME] size [W]x[H] format [FORMAT]",
+            arguments: {
+              NAME: { type: "string", defaultValue: "renderTarget1" },
+              W: { type: "number", defaultValue: 480 },
+              H: { type: "number", defaultValue: 360 },
+              FORMAT: { type: "string", menu: "texTypeMenu", defaultValue: "RGB8" }
+            }
+          },
           {
             opcode: "tex_LoadFromCostume",
             blockType: "command",
@@ -517,12 +550,12 @@
             }
           },
           {
-            opcode: "tex_LoadKTXToCubemap",
+            opcode: "tex_LoadKTXFromBase64",
             blockType: "command",
-            text: "load uncompressed KTX Cubemap [NAME] from URL [U]",
+            text: "load KTX Cubemap [NAME] from Base64 [B64]",
             arguments: {
-              U: { type: "string", defaultValue: "https://example.com/prefilter.ktx" },
-              NAME: { type: "string", defaultValue: "prefilterMap" }
+              NAME: { type: "string", defaultValue: "prefilterMap" },
+              B64: { type: "string" }
             }
           },
           {
@@ -533,6 +566,7 @@
               NAME: { type: "string", menu: "costumeMenu" }
             }
           },
+          "---",
           {
             opcode: "gl_BindTexture",
             blockType: "command",
@@ -543,7 +577,17 @@
             }
           },
           {
-            opcode: "gl_GenerateMipmap",
+            opcode: "gl_BindCubemap",
+            blockType: "command",
+            text: "glActiveTexture [UNIT] bind Cubemap [TEX]",
+            arguments: {
+              TEX: { type: "string", defaultValue: "prefilterMap" },
+              UNIT: { type: "number", defaultValue: 0 }
+            }
+          },
+          "---",
+          {
+            opcode: "tex_GenerateMipmap",
             blockType: "command",
             text: "glGenerateMipmap [TEX]",
             arguments: {
@@ -572,24 +616,24 @@
 
           "---",
           { blockType: "label", text: "Render" },
-
           { opcode: "gl_Draw", blockType: "command", text: "glDraw [ID] count [COUNT] mode [MODE]", arguments: { ID: { type: "string", defaultValue: "sample" }, COUNT: { type: "number" }, MODE: { type: "string", menu: "drawMode" } } },
           { opcode: "gl_Present", blockType: "command", text: "update layer" },
 
           "---",
           { blockType: "label", text: "GL States" },
-
           { opcode: "st_Enable", blockType: "command", text: "glEnable [CAP]", arguments: { CAP: { type: "string", menu: "capMenu" } } },
           { opcode: "st_Disable", blockType: "command", text: "glDisable [CAP]", arguments: { CAP: { type: "string", menu: "capMenu" } } },
+          
+          "---",
+          { opcode: "st_DepthMask", blockType: "command", text: "glDepthMask [STATE]", arguments: { STATE: { type: "string", menu: "boolMenu", defaultValue: "true" } } },
+          { opcode: "st_DepthFunc", blockType: "command", text: "glDepthFunc [FUNC]", arguments: { FUNC: { type: "string", menu: "depthFuncMenu", defaultValue: "LESS" } } },
 
           "---",
-          { blockType: "label", text: "Stencil" },
-
           { opcode: "st_StencilOp", blockType: "command", text: "glStencilOp [SF] [DF] [DP]", arguments: { SF: { type: "string", menu: "opMenu" }, DF: { type: "string", menu: "opMenu" }, DP: { type: "string", menu: "opMenu" } } },
 
+          
           "---",
           { blockType: "label", text: "Math" },
-
           {
             opcode: "v3_Init", blockType: "command", text: "vec3 [ID] = X [X] Y [Y] Z [Z]",
             arguments: { ID: { type: "string", defaultValue: "v1" }, X: { type: "number" }, Y: { type: "number" }, Z: { type: "number" } }
@@ -630,11 +674,18 @@
           costumeMenu: { acceptReporters: true, items: "tex_getCostumes"},
           listMenu: { acceptReporters: true, items: "getAllLists" },
           compSizeMenu: ["1", "2", "3", "4"],
-          fboTypeMenu: ["RGB16F", "RGBA16F", "RGB32F", "RGB8", "RGBA8", "R11G11B10F", "R16F", "RG16F", "NONE"],
+          texTypeMenu: [
+            "RGB16F", "RGBA16F", "RGB32F",
+            "RGB8", "RGBA8",
+            "R11G11B10F", "R16F", "RG16F",
+            "DEPTH24_STENCIL8", "DEPTH_COMPONENT24"
+          ],          fboSlotMenu: ["COLOR_ATTACHMENT0", "COLOR_ATTACHMENT1", "COLOR_ATTACHMENT2", "COLOR_ATTACHMENT3", "DEPTH_STENCIL_ATTACHMENT", "DEPTH_ATTACHMENT"],
           depthMenu: ["RBO", "TEXTURE","NONE"],
           filterMode: ["NEAREST","LINEAR","NEAREST_MIPMAP_NEAREST","LINEAR_MIPMAP_NEAREST","NEAREST_MIPMAP_LINEAR","LINEAR_MIPMAP_LINEAR"],
           wrapAxis: ["S","T"],
           wrapMode: ["REPEAT","CLAMP_TO_EDGE","MIRRORED_REPEAT"],
+          boolMenu: ["true", "false"],
+          depthFuncMenu: ["NEVER", "LESS", "EQUAL", "LEQUAL", "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS"],
         }
       };
     }
@@ -657,6 +708,7 @@
       gl3d.enable(gl3d.STENCIL_TEST);
 
       gl3d.getExtension('OES_texture_float_linear');
+      gl3d.getExtension('OES_texture_half_float_linear');
       const ext = gl3d.getExtension('EXT_color_buffer_float');
 
       // 劫持原有画布，禁用渲染
@@ -802,104 +854,37 @@
       const p = shaders.get(ID); if (p) gl3d.uniform1i(gl3d.getUniformLocation(p, NAME), V);
     }
 
-    fbo_Create({ ID, W, H, A0, A1, A2, A3, D }) {
+    fbo_Create({ ID }) {
       if (fbos.has(ID)) return;
-
       const fbo = gl3d.createFramebuffer();
-      gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, fbo);
+      fbos.set(ID, { fbo, width: 0, height: 0, activeSlots: [] });
+    }
+    fbo_AttachTexture({ ID, TEX, SLOT }) {
+      const fboEntry = fbos.get(ID);
+      const tex = textures.get(TEX);
+      const texInfo = textures.get(TEX + "_info");
 
-      const configs = [A0, A1, A2, A3];
-      const activeAttachments = [];
+      if (!fboEntry || !tex) return;
 
-      // 格式映射表
-      const formatMap = {
-        // HDR
-        "RGB16F": { internal: gl3d.RGB16F, format: gl3d.RGB, type: gl3d.HALF_FLOAT }, // 不知道为啥，我的电脑无法用RGB16F
-        "RGBA16F": { internal: gl3d.RGBA16F, format: gl3d.RGBA, type: gl3d.HALF_FLOAT }, 
-        "RGB32F": { internal: gl3d.RGB32F, format: gl3d.RGB, type: gl3d.FLOAT },
+      gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, fboEntry.fbo);
 
-        // 标准 LDR (8位)
-        "RGB8": { internal: gl3d.RGB8, format: gl3d.RGB, type: gl3d.UNSIGNED_BYTE },
-        "RGBA8": { internal: gl3d.RGBA8, format: gl3d.RGBA, type: gl3d.UNSIGNED_BYTE },
+      const attachmentPoint = gl3d[SLOT];
 
-        // PBR 合并参数用的，参考glTF
-        "R11G11B10F": { internal: gl3d.R11F_G11F_B10F, format: gl3d.RGB, type: gl3d.FLOAT },
+      gl3d.framebufferTexture2D(gl3d.FRAMEBUFFER, attachmentPoint, gl3d.TEXTURE_2D, tex, 0);
 
-        // 单通道/双通道
-        "R16F": { internal: gl3d.R16F, format: gl3d.RED, type: gl3d.HALF_FLOAT },
-        "RG16F": { internal: gl3d.RG16F, format: gl3d.RG, type: gl3d.HALF_FLOAT },
-
-        "NONE": null
-      };
-
-      configs.forEach((typeStr, i) => {
-        if (typeStr === "NONE") return;
-
-        const conf = formatMap[typeStr];
-        const tex = gl3d.createTexture();
-        gl3d.bindTexture(gl3d.TEXTURE_2D, tex);
-
-        gl3d.texImage2D(gl3d.TEXTURE_2D, 0, conf.internal, W, H, 0, conf.format, conf.type, null);
-
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.LINEAR);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
-
-        // 挂载到 FBO
-        const attachmentPoint = gl3d.COLOR_ATTACHMENT0 + i;
-        gl3d.framebufferTexture2D(gl3d.FRAMEBUFFER, attachmentPoint, gl3d.TEXTURE_2D, tex, 0);
-
-        // 保存纹理引用，方便后续调用
-        textures.set(`${ID}_tex${i}`, tex);
-        activeAttachments.push(attachmentPoint);
-      });
-
-      // 告诉 WebGL 哪些槽位需要输出颜色
-      if (activeAttachments.length > 0) {
-        gl3d.drawBuffers(activeAttachments);
-      } else {
-        gl3d.drawBuffers([gl3d.NONE]);
+      if (SLOT.startsWith("COLOR_ATTACHMENT")) {
+        if (!fboEntry.activeSlots.includes(attachmentPoint)) {
+          fboEntry.activeSlots.push(attachmentPoint);
+          fboEntry.activeSlots.sort();
+          gl3d.drawBuffers(fboEntry.activeSlots);
+        }
       }
 
-      if (D === "RBO") {
-        // 仅用于渲染加速，不可读
-        const rbo = gl3d.createRenderbuffer();
-        gl3d.bindRenderbuffer(gl3d.RENDERBUFFER, rbo);
-        gl3d.renderbufferStorage(gl3d.RENDERBUFFER, gl3d.DEPTH24_STENCIL8, W, H);
-        gl3d.framebufferRenderbuffer(gl3d.FRAMEBUFFER, gl3d.DEPTH_STENCIL_ATTACHMENT, gl3d.RENDERBUFFER, rbo);
-        rbos.push(rbo);
-      }
-      else if (D === "TEXTURE") {
-        // 可采样
-        const depthTex = gl3d.createTexture();
-        gl3d.bindTexture(gl3d.TEXTURE_2D, depthTex);
-
-        gl3d.texImage2D(
-          gl3d.TEXTURE_2D, 0, gl3d.DEPTH24_STENCIL8,
-          W, H, 0, gl3d.DEPTH_STENCIL, gl3d.UNSIGNED_INT_24_8, null
-        );
-
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.NEAREST);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.NEAREST);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
-        gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
-
-        // 挂载到 FBO 的深度模板附件点
-        gl3d.framebufferTexture2D(
-          gl3d.FRAMEBUFFER, gl3d.DEPTH_STENCIL_ATTACHMENT,
-          gl3d.TEXTURE_2D, depthTex, 0
-        );
-
-        textures.set(`${ID}_depth`, depthTex);
+      if (texInfo && fboEntry.width === 0) {
+        fboEntry.width = texInfo.w;
+        fboEntry.height = texInfo.h;
       }
 
-      const status = gl3d.checkFramebufferStatus(gl3d.FRAMEBUFFER);
-      if (status !== gl3d.FRAMEBUFFER_COMPLETE) {
-        console.error(`Vapor3D: FBO "${ID}" is incomplete! Status: ${status}`);
-      }
-
-      fbos.set(ID, { fbo, width: W, height: H }); // 保存 W 和 H 便于绑定到 fbo0 时对齐
       gl3d.bindFramebuffer(gl3d.FRAMEBUFFER, null);
     }
 
@@ -931,7 +916,27 @@
       vaos.set(ID, { vao, hasElements: false }); gl3d.bindVertexArray(null);
       vaos.set(ID, { vao, hasElements: false, defaultCount: 6 });
     }
-
+    vao_CreateCube({ ID }) {
+      if (vaos.has(ID)) return;
+      const vertices = [
+        -1, -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, -1, 1, -1, -1, -1, -1,
+        -1, -1, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, -1, -1, 1,
+        -1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, -1, 1, 1,
+        1, 1, 1, 1, 1, -1, 1, -1, -1, 1, -1, -1, 1, -1, 1, 1, 1, 1,
+        -1, -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, -1, -1,
+        -1, 1, -1, 1, 1, -1, 1, 1, 1, 1, 1, 1, -1, 1, 1, -1, 1, -1
+      ];
+      const vao = gl3d.createVertexArray();
+      gl3d.bindVertexArray(vao);
+      const buf = gl3d.createBuffer();
+      gl3d.bindBuffer(gl3d.ARRAY_BUFFER, buf);
+      gl3d.bufferData(gl3d.ARRAY_BUFFER, new Float32Array(vertices), gl3d.STATIC_DRAW);
+      gl3d.enableVertexAttribArray(0);
+      gl3d.vertexAttribPointer(0, 3, gl3d.FLOAT, false, 0, 0);
+      vbos.push(buf);
+      vaos.set(ID, { vao, hasElements: false, defaultCount: 36 });
+      gl3d.bindVertexArray(null);
+    }
     vao_CreateCustom({ ID, L0, S0, L1, S1, L2, S2, L3, S3, I }, util) {
       if (vaos.has(ID)) return;
 
@@ -1025,6 +1030,14 @@
     st_Enable({ CAP }) { gl3d.enable(gl3d[CAP]); }
     st_Disable({ CAP }) { gl3d.disable(gl3d[CAP]); }
     st_StencilOp({ SF, DF, DP }) { gl3d.stencilOp(gl3d[SF], gl3d[DF], gl3d[DP]); }
+    st_DepthMask({ STATE }) {
+      if (!gl3d) return;
+      gl3d.depthMask(STATE === "true");
+    }
+    st_DepthFunc({ FUNC }) {
+      if (!gl3d) return;
+      gl3d.depthFunc(gl3d[FUNC]);
+    }
 
     gl_BindTexture({ TEX, UNIT }) {
       gl3d.activeTexture(gl3d.TEXTURE0 + UNIT);
@@ -1035,6 +1048,22 @@
         gl3d.bindTexture(gl3d.TEXTURE_2D, texObject);
       } else {
         gl3d.bindTexture(gl3d.TEXTURE_2D, null);
+      }
+    }
+    gl_BindCubemap({ TEX, UNIT }) {
+      const slot = (parseInt(UNIT) || 0);
+      gl3d.activeTexture(gl3d.TEXTURE0 + slot);
+
+      const texObject = textures.get(TEX);
+
+      if (texObject instanceof WebGLTexture) {
+        gl3d.bindTexture(gl3d.TEXTURE_CUBE_MAP, texObject);
+      } else {
+        gl3d.bindTexture(gl3d.TEXTURE_CUBE_MAP, null);
+
+        if (texObject === "loading") {
+          // console.log(`Vapor3D: still loading`);
+        }
       }
     }
     tex_SetFilter({ TEX, MODE }) {
@@ -1061,7 +1090,7 @@
       gl3d.bindTexture(gl3d.TEXTURE_2D, texObject);
       gl3d.texParameteri(gl3d.TEXTURE_2D, axisMap[AXIS], modeMap[MODE]);
     }
-    gl_GenerateMipmap({ TEX }) {
+    tex_GenerateMipmap({ TEX }) {
       const texObject = textures.get(TEX);
       if (!texObject) {
         console.warn(`Vapor3D: Cannot generate mipmap, texture "${TEX}" not found.`);
@@ -1072,6 +1101,22 @@
     }
     tex_getCostumes() {
       return (vm.editingTarget ? vm.editingTarget.getCostumes() : []).map(c => c.name);
+    }
+    tex_CreateEmpty({ NAME, W, H, FORMAT }) {
+      if (textures.has(NAME)) return;
+      const conf = _getFormatConfig(FORMAT);
+
+      const tex = gl3d.createTexture();
+      gl3d.bindTexture(gl3d.TEXTURE_2D, tex);
+      gl3d.texImage2D(gl3d.TEXTURE_2D, 0, conf.internal, W, H, 0, conf.format, conf.type, null);
+
+      gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MIN_FILTER, gl3d.LINEAR);
+      gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
+      gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
+      gl3d.texParameteri(gl3d.TEXTURE_2D, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
+
+      textures.set(NAME, tex);
+      textures.set(NAME + "_info", { w: W, h: H });
     }
     async tex_LoadFromCostume({ C, NAME }, { target }) {
 
@@ -1152,37 +1197,37 @@
         console.error(`Vapor3D: Failed to load URL texture [${NAME}]:`, e);
       }
     }
-    async tex_LoadKTXToCubemap({ U, NAME }) {
+    async tex_LoadKTXFromBase64({ B64, NAME }) {
       if (textures.has(NAME)) return;
-      const url = String(U).trim();
+      const b64String = String(B64).trim();
+      if (!b64String) return;
 
       textures.set(NAME, "loading");
-      console.log(`Vapor3D: Loading KTX Cubemap from ${url}...`);
 
       try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const cleanB64 = b64String.includes(',') ? b64String.split(',')[1] : b64String;
+        const response = await fetch(`data:application/octet-stream;base64,${cleanB64}`);
         const buffer = await response.arrayBuffer();
 
-        // 1. 调用外部解析器
         const ktx = _parseKTX(buffer);
+        if (ktx.mipmaps && ktx.mipmaps[0]) {
+          console.log(`Vapor3D Debug: Mip0 Face0 first 10 values:`, ktx.mipmaps[0].data.slice(0, 10));
+        }
 
-        // 2. 初始化 Cubemap 纹理
         const tex = gl3d.createTexture();
         gl3d.bindTexture(gl3d.TEXTURE_CUBE_MAP, tex);
 
-        // 确保 WebGL 支持对浮点数进行线性过滤 (非常重要)
-        gl3d.getExtension('OES_texture_float_linear');
-        gl3d.getExtension('OES_texture_half_float_linear');
-        gl3d.getExtension('EXT_color_buffer_float');
+        // 强制 4 字节对齐
+        gl3d.pixelStorei(gl3d.UNPACK_ALIGNMENT, 4);
 
-        // 3. 循环上传 30 个数据块 (6面 * 5层)
+
         ktx.mipmaps.forEach(mip => {
           const target = gl3d.TEXTURE_CUBE_MAP_POSITIVE_X + mip.face;
+
           gl3d.texImage2D(
             target,
             mip.level,
-            ktx.glInternalFormat, // KTX 文件已经自带了正确的格式枚举 (例如 gl.RGBA16F)
+            ktx.glInternalFormat,
             mip.width,
             mip.height,
             0,
@@ -1192,19 +1237,25 @@
           );
         });
 
-        // Cubemap 过滤
-        const hasMipmaps = ktx.numberOfMipmapLevels > 1;
-        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MIN_FILTER, hasMipmaps ? gl3d.LINEAR_MIPMAP_LINEAR : gl3d.LINEAR);
+        gl3d.bindTexture(gl3d.TEXTURE_CUBE_MAP, tex);
+
+        const mipCount = ktx.numberOfMipmapLevels;
+
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MAX_LEVEL, mipCount - 1);
+
+        const minFilter = (mipCount > 1) ? gl3d.LINEAR_MIPMAP_LINEAR : gl3d.LINEAR;
+        gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MIN_FILTER, minFilter);
         gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_MAG_FILTER, gl3d.LINEAR);
+
         gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_S, gl3d.CLAMP_TO_EDGE);
         gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_T, gl3d.CLAMP_TO_EDGE);
         gl3d.texParameteri(gl3d.TEXTURE_CUBE_MAP, gl3d.TEXTURE_WRAP_R, gl3d.CLAMP_TO_EDGE);
 
         textures.set(NAME, tex);
-        console.log(`Vapor3D: KTX Cubemap [${NAME}] loaded successfully. Levels: ${ktx.numberOfMipmapLevels}`);
+        console.log(`Vapor3D: KTX [${NAME}] Loaded.`);
       } catch (e) {
         textures.delete(NAME);
-        console.error(`Vapor3D: KTX Cubemap load failed:`, e);
+        console.error(`Vapor3D: KTX Load Error:`, e);
       }
     }
     tex_Destroy({ NAME }) {
