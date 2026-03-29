@@ -1,10 +1,10 @@
-# Vapor3D Engine
+# Vapor 3D Engine
 
 高性能、可编程的 **多阶段渲染管线 (Multi-Stage Pipeline)** 框架。
 
 ---
 
-> **TODO**: 文档目前仅为大纲，我有时间再来详细补充 API 接口与集成指南。
+> **TODO**: 扩展处于测试阶段，可能会有各种问题。文档目前仅为大纲，我有时间再来写详细使用方法。
 
 ---
 
@@ -15,14 +15,16 @@
 
 ## 渲染效果
 
-<img src="screenshots/4f608e9e7445583d0d3df88c7549e611.png" width="300px" alt="Rain Effect Demo">
+![rain](screenshots/4f608e9e7445583d0d3df88c7549e611.png)
+![IBL1](screenshots/IBL2.png)
+![IBL1](screenshots/IBL1.png)
+
+* 可前往 example/ 查看我最近在写的一些二次开发作品，均采用MIT开源
 
 ## 提示
 
-* **精度**：albedo 和 pbr 可使用 RGB8，position、normal 必须使用 RGBA16F，example 中 pbr 的 finalColor 也用了 RGBA16F 因为需要进行 gamma 矫正
-* **示例**：可前往 example/ 查看我最近在写的一些二次开发作品，均采用MIT开源
-
 > `example/pbr.sb3` 示例中使用的 PBR 贴图来源于 FreePBR.com。该资源遵循其官方授权协议，仅供学习与非商业演示使用。
+> `example/pbr.sb3` 示例中使用的 IBL 预卷积贴图来源于 cmftStudio 官方示例资源。该资源版权归原作者所有，仅供学习与非商业演示使用。
 
 
 **By: Joy_Ful** | License: MPL-2.0
