@@ -1,9 +1,9 @@
 // Name: OmniGLB
 // ID: omniGLB
 // Description: Better GLB loader
-// By: Joy_Ful <https://github.com/JoyFul114514>
+// By: Joy_Ful <https://github.com/JoyFul721>
 // License: MPL-2.0 AND BSD-3-Clause
-// Version: 1.4.8 - Added Direct List Injection
+// Version: 1.5.0 - Tailored
 
 (function (Scratch) {
     'use strict';
@@ -253,7 +253,7 @@
             return {
                 id: 'omniGLB',
                 docsURI: 'https://github.com/JoyFul114514/Conf-Engine',
-                name: 'vaporOmniGLB',
+                name: 'Vapor 3D - OmniGLB',
                 color1: '#7db4b2',
                 blocks: [
                     { blockType: Scratch.BlockType.LABEL, text: "场景&内存" },

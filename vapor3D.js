@@ -1,7 +1,7 @@
 // Name: Vapor 3D
 // ID: vapor3D
 // Description: 3D Engine for Turbowarp
-// By: Joy_Ful <https://github.com/JoyFul114514>
+// By: Joy_Ful <https://github.com/JoyFul721>
 // License: MPL-2.0 AND BSD-3-Clause
 // Version: 1.2.0 - Added Irradiance Map support
 
